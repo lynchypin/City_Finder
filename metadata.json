@@ -1,0 +1,5 @@
+{
+  "name": "Sales Navigator Client MatcherGH",
+  "description": "An intelligent tool to help you find clients from a Google Sheet on LinkedIn Sales Navigator and identify their city. This app uses AI to refine search queries for better matching accuracy.",
+  "requestFramePermissions": []
+}
