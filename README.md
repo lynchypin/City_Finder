@@ -2,8 +2,9 @@
 
 An intelligent tool to help you find clients from a Google Sheet and enrich their contact information with their current city and job title using AI. This app uses Google Gemini with search grounding (and optionally OpenAI) to refine research and provide up-to-date information, saving you hours of manual work.
 
+![Sales Navigator Client Matcher Screenshot](https://storage.googleapis.com/aistudio-public-images/readme_screenshots/sales-navigator-client-matcher.png)
 
-## Features
+## ✨ Features
 
 - **Google Sheet Integration:** Easily import your client list from any Google Sheet.
 - **AI-Powered Contact Research:**
