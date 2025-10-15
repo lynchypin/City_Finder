@@ -13,14 +13,12 @@ const parseCSV = (csvText: string): Client[] => {
   // This makes the parser resilient to empty leading lines or metadata from the export.
   const headerRowIndex = lines.findIndex(line =>
     line.toLowerCase().includes('client first name') &&
-    line.toLowerCase().includes('client second name') &&
-    line.toLowerCase().includes('job title') &&
-    line.toLowerCase().includes('company')
+    line.toLowerCase().includes('client second name')
   );
 
   if (headerRowIndex === -1) {
     // This is a more informative error. It suggests the content received is not the expected CSV.
-    throw new Error('CSV headers are missing or incorrect. Expected "Client first name", "Client second name", "Job Title", "Company".');
+    throw new Error('CSV headers are missing or incorrect. Expected at least "Client first name" and "Client second name".');
   }
 
   // Helper to parse a single line, handling quoted commas.
@@ -36,31 +34,38 @@ const parseCSV = (csvText: string): Client[] => {
   const lastNameIndex = headers.indexOf('client second name');
   const jobTitleIndex = headers.indexOf('job title');
   const companyIndex = headers.indexOf('company');
+  const cityHeaderOptions = ['identified city', 'city'];
+  const cityIndex = headers.findIndex(h => cityHeaderOptions.includes(h));
 
-  if (firstNameIndex === -1 || lastNameIndex === -1 || jobTitleIndex === -1 || companyIndex === -1) {
+
+  if (firstNameIndex === -1 || lastNameIndex === -1) {
     throw new Error(`Could not map all required CSV columns. Found headers: [${headers.join(', ')}]`);
   }
 
   const dataLines = lines.slice(headerRowIndex + 1);
 
-  // FIX: Add explicit return type `Client | null` to the map callback. This ensures the
-  // `cityStatus` property is correctly typed, resolving downstream type errors.
   return dataLines.map((line, index): Client | null => {
     // Skip any empty lines in the CSV
     if (!line.trim()) {
       return null;
     }
     const values = parseLine(line);
+
+    // If a city column exists and has data, skip this row from being processed.
+    if (cityIndex > -1 && values[cityIndex] && values[cityIndex].trim() !== '') {
+      return null;
+    }
+    
     return {
       id: index,
       firstName: values[firstNameIndex] || '',
       lastName: values[lastNameIndex] || '',
-      jobTitle: values[jobTitleIndex] || '',
-      company: values[companyIndex] || '',
+      jobTitle: jobTitleIndex > -1 ? values[jobTitleIndex] || '' : '',
+      company: companyIndex > -1 ? values[companyIndex] || '' : '',
       city: '',
       cityStatus: 'idle',
     };
-  }).filter((client): client is Client => client !== null); // Filter out null entries from empty lines
+  }).filter((client): client is Client => client !== null); // Filter out null entries from empty or skipped lines
 };
 
 export const fetchClients = async (sheetId: string): Promise<Client[]> => {

@@ -2,6 +2,7 @@ import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { Client } from './types';
 import { fetchClients } from './services/googleSheetService';
 import { initializeGemini, findClientCitiesBatch } from './services/geminiService';
+import { initializeOpenAI, findClientCitiesBatchOpenAI } from './services/openaiService';
 import Header from './components/Header';
 import ClientTable from './components/ClientTable';
 import Loader from './components/Loader';
@@ -12,6 +13,7 @@ const RPM_DELAY = 10000; // 10 seconds. Increased delay for a safer margin under
 const LOCAL_STORAGE_KEY_CLIENTS = 'client-city-data';
 const LOCAL_STORAGE_KEY_API_KEY = 'gemini-api-key';
 const LOCAL_STORAGE_KEY_SHEET_ID = 'google-sheet-id';
+const LOCAL_STORAGE_KEY_OPENAI_API_KEY = 'openai-api-key';
 
 
 // Creates a stable, unique key for a client based on their core details.
@@ -25,6 +27,9 @@ const App: React.FC = () => {
   const [apiKey, setApiKey] = useState<string>(
     () => localStorage.getItem(LOCAL_STORAGE_KEY_API_KEY) || ''
   );
+  const [openAiApiKey, setOpenAiApiKey] = useState<string>(
+    () => localStorage.getItem(LOCAL_STORAGE_KEY_OPENAI_API_KEY) || ''
+  );
   const [sheetId, setSheetId] = useState<string>(
     () => localStorage.getItem(LOCAL_STORAGE_KEY_SHEET_ID) || ''
   );
@@ -34,6 +39,7 @@ const App: React.FC = () => {
   const [isLoading, setIsLoading] = useState<boolean>(() => !!(apiKey && sheetId));
   const [error, setError] = useState<boolean>(false);
   const [isFindingAll, setIsFindingAll] = useState<boolean>(false);
+  const [isRetrying, setIsRetrying] = useState<boolean>(false); // Used for all OpenAI operations
   const [rateLimitMessage, setRateLimitMessage] = useState<string>('');
   const [showDailyLimitWarning, setShowDailyLimitWarning] = useState<boolean>(false);
   const rateLimitHistory = useRef<number[]>([]);
@@ -41,14 +47,23 @@ const App: React.FC = () => {
   // Derived state to determine if the app is configured.
   const isConfigured = !!apiKey && !!sheetId;
 
-  const handleSetupSubmit = (data: { apiKey: string; sheetId: string }) => {
+  const handleSetupSubmit = (data: { apiKey: string; sheetId: string; openAiApiKey: string }) => {
     if (data.apiKey.trim() && data.sheetId.trim()) {
       const newApiKey = data.apiKey.trim();
       const newSheetId = data.sheetId.trim();
+      const newOpenAiKey = data.openAiApiKey.trim();
+      
       localStorage.setItem(LOCAL_STORAGE_KEY_API_KEY, newApiKey);
       localStorage.setItem(LOCAL_STORAGE_KEY_SHEET_ID, newSheetId);
+      if(newOpenAiKey) {
+        localStorage.setItem(LOCAL_STORAGE_KEY_OPENAI_API_KEY, newOpenAiKey);
+      } else {
+        localStorage.removeItem(LOCAL_STORAGE_KEY_OPENAI_API_KEY);
+      }
+      
       setApiKey(newApiKey);
       setSheetId(newSheetId);
+      setOpenAiApiKey(newOpenAiKey);
       setIsLoading(true); // Start loading clients after setup
     }
   };
@@ -57,8 +72,10 @@ const App: React.FC = () => {
     localStorage.removeItem(LOCAL_STORAGE_KEY_API_KEY);
     localStorage.removeItem(LOCAL_STORAGE_KEY_SHEET_ID);
     localStorage.removeItem(LOCAL_STORAGE_KEY_CLIENTS);
+    localStorage.removeItem(LOCAL_STORAGE_KEY_OPENAI_API_KEY);
     setApiKey('');
     setSheetId('');
+    setOpenAiApiKey('');
     setClients([]);
     setIsLoading(false); // Not configured, so not loading
     setError(false); // Reset any previous errors
@@ -72,13 +89,18 @@ const App: React.FC = () => {
       const fetchedClients = await fetchClients(id);
       
       const savedDataRaw = localStorage.getItem(LOCAL_STORAGE_KEY_CLIENTS);
-      const savedData: Record<string, { city: string; cityStatus: Client['cityStatus'] }> = savedDataRaw ? JSON.parse(savedDataRaw) : {};
+      const savedData: Record<string, { city: string; cityStatus: Client['cityStatus']; jobTitle?: string }> = savedDataRaw ? JSON.parse(savedDataRaw) : {};
 
       const mergedClients = fetchedClients.map(client => {
         const key = getClientUniqueKey(client);
         const savedClient = savedData[key];
         if (savedClient) {
-          return { ...client, city: savedClient.city, cityStatus: savedClient.cityStatus };
+          return { 
+            ...client, 
+            city: savedClient.city, 
+            cityStatus: savedClient.cityStatus,
+            jobTitle: savedClient.jobTitle !== undefined ? savedClient.jobTitle : client.jobTitle
+          };
         }
         return client;
       });
@@ -97,6 +119,9 @@ const App: React.FC = () => {
     if (isConfigured) {
       try {
         initializeGemini(apiKey);
+        if(openAiApiKey) {
+          initializeOpenAI(openAiApiKey);
+        }
         loadClients(sheetId);
       } catch (e) {
         console.error("Failed to initialize with stored settings. Clearing invalid key.", e);
@@ -104,20 +129,21 @@ const App: React.FC = () => {
       }
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isConfigured, apiKey, sheetId]); // loadClients is stable and doesn't need to be in deps
+  }, [isConfigured, apiKey, sheetId, openAiApiKey]); // loadClients is stable and doesn't need to be in deps
 
   // Effect to save client data to localStorage whenever it changes
   useEffect(() => {
     if (isLoading || clients.length === 0 || !isConfigured) {
       return;
     }
-    const dataToStore: Record<string, { city: string; cityStatus: Client['cityStatus'] }> = {};
+    const dataToStore: Record<string, { city: string; cityStatus: Client['cityStatus']; jobTitle: string }> = {};
     clients.forEach(client => {
-      if (client.cityStatus !== 'idle' || client.city) {
+      if (client.cityStatus !== 'idle') {
         const key = getClientUniqueKey(client);
         dataToStore[key] = {
           city: client.city,
           cityStatus: client.cityStatus,
+          jobTitle: client.jobTitle,
         };
       }
     });
@@ -133,22 +159,24 @@ const App: React.FC = () => {
     );
   }, []);
   
-  const processApiResult = (resultMap: Map<number, string>) => {
-     // A successful API call will have a result that is not a recognized error string.
-     // This resets the consecutive rate limit counter.
-     const firstResult = resultMap.values().next().value;
-     if (firstResult && !['Invalid API Key', 'Rate Limit Exceeded', 'API Error'].includes(firstResult)) {
-       rateLimitHistory.current = [];
-     }
+  const processApiResult = (resultMap: Map<number, { city: string; jobTitle: string } | string>) => {
+    const firstResultValue = resultMap.values().next().value;
 
-     for (const [id, foundCity] of resultMap.entries()) {
-        if (foundCity === 'Invalid API Key') {
-            setRateLimitMessage("The provided API Key is invalid. Resetting settings.");
+    // Handle batch-wide fatal errors first
+    if (typeof firstResultValue === 'string') {
+        if (firstResultValue === 'Invalid API Key') {
+            setRateLimitMessage("An invalid API Key was provided. Resetting settings.");
             handleResetSettings();
             return 'STOP';
         }
-
-        if (foundCity === 'Rate Limit Exceeded') {
+        if (firstResultValue === 'Insufficient Quota') {
+            setRateLimitMessage("OpenAI Quota Exceeded. Please check your plan and billing details on the OpenAI website.");
+            setClients(prev => prev.map(c => 
+                resultMap.has(c.id) ? { ...c, cityStatus: 'error', city: 'Quota Exceeded' } : c
+            ));
+            return 'STOP';
+        }
+        if (firstResultValue === 'Rate Limit Exceeded') {
             setRateLimitMessage("API rate limit reached. Paused processing. Please wait a minute and try again.");
             
             const now = Date.now();
@@ -163,24 +191,44 @@ const App: React.FC = () => {
             }
             
             setClients(prev => prev.map(c => 
-                resultMap.has(c.id)
-                ? { ...c, cityStatus: 'error', city: 'Rate Limited' } 
-                : c
+                resultMap.has(c.id) ? { ...c, cityStatus: 'error', city: 'Rate Limited' } : c
             ));
             return 'STOP';
         }
+    } else if (typeof firstResultValue === 'object') {
+        // A successful API call will have an object as a result.
+        // This resets the consecutive rate limit counter.
+        rateLimitHistory.current = [];
+    }
 
-        setClients(prevClients =>
-            prevClients.map(client =>
-                client.id === id ? { 
-                    ...client, 
-                    city: foundCity, 
-                    cityStatus: foundCity.toLowerCase() === 'not found' ? 'not_found' : 'found' 
-                } : client
-            )
-        );
-     }
-     return 'CONTINUE';
+    // Process individual results from the batch
+    for (const [id, result] of resultMap.entries()) {
+        if (result && typeof result === 'object') {
+            // This is a successful result with city and job title
+            setClients(prevClients =>
+                prevClients.map(client =>
+                    client.id === id ? { 
+                        ...client, 
+                        city: result.city, 
+                        jobTitle: result.jobTitle || client.jobTitle, // Keep original title if AI returns empty
+                        cityStatus: result.city.toLowerCase() === 'not found' ? 'not_found' : 'found' 
+                    } : client
+                )
+            );
+        } else if (typeof result === 'string') {
+            // This is an individual error string (e.g., "Error: No result from AI")
+            setClients(prevClients =>
+                prevClients.map(client =>
+                    client.id === id ? { 
+                        ...client, 
+                        city: result,
+                        cityStatus: 'error'
+                    } : client
+                )
+            );
+        }
+    }
+    return 'CONTINUE';
   };
 
   const handleFindCity = useCallback(async (id: number) => {
@@ -199,7 +247,7 @@ const App: React.FC = () => {
   }, [clients]);
   
   const handleFindAllCities = useCallback(async () => {
-    const clientsToFind = clients.filter(c => !c.city || c.cityStatus === 'error' || c.cityStatus === 'not_found');
+    const clientsToFind = clients.filter(c => c.cityStatus !== 'found');
     if (clientsToFind.length === 0) return;
   
     setIsFindingAll(true);
@@ -230,6 +278,74 @@ const App: React.FC = () => {
     }
   
     setIsFindingAll(false);
+  }, [clients]);
+
+  const handleFindAllWithOpenAI = useCallback(async () => {
+    const clientsToFind = clients.filter(c => c.cityStatus !== 'found');
+    if (clientsToFind.length === 0) return;
+
+    setIsRetrying(true); // Reuse the 'isRetrying' state for all OpenAI bulk operations
+    setRateLimitMessage('');
+
+    setClients(prevClients =>
+      prevClients.map(c =>
+        clientsToFind.some(ctf => ctf.id === c.id) ? { ...c, cityStatus: 'finding' } : c
+      )
+    );
+
+    for (let i = 0; i < clientsToFind.length; i += BATCH_SIZE) {
+        const batch = clientsToFind.slice(i, i + BATCH_SIZE);
+        const resultMap = await findClientCitiesBatchOpenAI(batch);
+        const status = processApiResult(resultMap);
+        
+        if (status === 'STOP') {
+            const remainingClientIds = clientsToFind.slice(i).map(c => c.id);
+            setClients(prev => prev.map(c =>
+                remainingClientIds.includes(c.id) ? { ...c, cityStatus: 'error', city: c.city || 'Not Processed' } : c
+            ));
+            break;
+        }
+
+        if (i + BATCH_SIZE < clientsToFind.length) {
+            await new Promise(resolve => setTimeout(resolve, 2000));
+        }
+    }
+
+    setIsRetrying(false);
+  }, [clients]);
+
+  const handleRetryWithOpenAI = useCallback(async () => {
+    const clientsToFind = clients.filter(c => c.cityStatus === 'error' || c.cityStatus === 'not_found');
+    if (clientsToFind.length === 0) return;
+
+    setIsRetrying(true);
+    setRateLimitMessage('');
+
+    setClients(prevClients =>
+      prevClients.map(c =>
+        clientsToFind.some(ctf => ctf.id === c.id) ? { ...c, cityStatus: 'finding' } : c
+      )
+    );
+
+    for (let i = 0; i < clientsToFind.length; i += BATCH_SIZE) {
+        const batch = clientsToFind.slice(i, i + BATCH_SIZE);
+        const resultMap = await findClientCitiesBatchOpenAI(batch);
+        const status = processApiResult(resultMap);
+        
+        if (status === 'STOP') {
+            const remainingClientIds = clientsToFind.slice(i).map(c => c.id);
+            setClients(prev => prev.map(c =>
+                remainingClientIds.includes(c.id) ? { ...c, cityStatus: 'error', city: c.city || 'Not Processed' } : c
+            ));
+            break;
+        }
+
+        if (i + BATCH_SIZE < clientsToFind.length) {
+            await new Promise(resolve => setTimeout(resolve, 2000));
+        }
+    }
+
+    setIsRetrying(false);
   }, [clients]);
 
   const handleDownloadCSV = () => {
@@ -309,7 +425,8 @@ const App: React.FC = () => {
     return <ApiKeySetup onSubmit={handleSetupSubmit} />;
   }
 
-  const clientsToFindCount = clients.filter(c => !c.city || c.cityStatus === 'error' || c.cityStatus === 'not_found').length;
+  const clientsToProcessCount = clients.filter(c => c.cityStatus !== 'found' && c.cityStatus !== 'finding').length;
+  const clientsToRetryCount = clients.filter(c => c.cityStatus === 'not_found' || c.cityStatus === 'error').length;
 
   return (
     <div className="min-h-screen bg-gray-100 dark:bg-gray-dark font-sans">
@@ -341,11 +458,12 @@ const App: React.FC = () => {
               </div>
             )}
             <div className="mb-6 bg-white dark:bg-gray-medium p-4 rounded-lg shadow-md">
-                <div className="flex flex-col md:flex-row justify-between items-start">
+                <div className="flex flex-col md:flex-row justify-between items-start md:items-center">
                     <div className="text-gray-700 dark:text-gray-300 text-left mb-4 md:mb-0">
                         <h3 className="font-bold text-lg">Instructions:</h3>
                         <ol className="list-decimal list-inside">
-                          <li><strong>Find All Cities:</strong> Click 'Find All' to process all clients at once.</li>
+                          <li><strong>Find Cities:</strong> Use 'Find All (Gemini)' or 'Find All (OpenAI)' to process all clients.</li>
+                          <li><strong>Retry Failed:</strong> Use 'Retry Failed with OpenAI' for any remaining unfound clients.</li>
                           <li><strong>Review & Edit:</strong> Manually correct any cities as needed.</li>
                           <li><strong>Download CSV:</strong> Save your updated list when you're done.</li>
                           <li><strong>Auto-Save:</strong> Your work is automatically saved in this browser.</li>
@@ -353,28 +471,32 @@ const App: React.FC = () => {
                     </div>
                     <div className="w-full md:w-auto flex flex-col md:flex-row items-center space-y-2 md:space-y-0 md:space-x-4">
                         <button
-                          onClick={handleResetSettings}
-                          className="w-full md:w-auto text-gray-600 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-700 font-bold py-2 px-4 rounded-lg transition-colors flex items-center justify-center"
-                          title="Reset API Key and Sheet ID"
-                        >
-                          <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
-                          </svg>
-                          Reset Settings
-                        </button>
-                        <button
                             onClick={handleFindAllCities}
-                            disabled={isFindingAll || clientsToFindCount === 0}
+                            disabled={isFindingAll || isRetrying || clientsToProcessCount === 0}
                             className="w-full md:w-auto bg-brand-primary hover:bg-brand-dark text-white font-bold py-2 px-4 rounded-lg transition-colors flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed"
                         >
                             {isFindingAll ? (
-                               <>
-                               <Loader size="sm" />
-                               <span className="ml-2">Finding All...</span>
-                               </>
-                            ) : `Find All Cities (${clientsToFindCount})`}
+                               <><Loader size="sm" /><span className="ml-2">Finding All (Gemini)...</span></>
+                            ) : `Find All (Gemini) (${clientsToProcessCount})`}
                         </button>
+                        {openAiApiKey && (
+                          <button
+                            onClick={handleFindAllWithOpenAI}
+                            disabled={isFindingAll || isRetrying || clientsToProcessCount === 0}
+                            className="w-full md:w-auto bg-gray-800 hover:bg-black text-white font-bold py-2 px-4 rounded-lg transition-colors flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed"
+                          >
+                            {isRetrying && !isFindingAll ? <><Loader size="sm" /><span className="ml-2">Finding All (OpenAI)...</span></> : `Find All (OpenAI) (${clientsToProcessCount})`}
+                          </button>
+                        )}
+                        {clientsToRetryCount > 0 && openAiApiKey && (
+                          <button
+                            onClick={handleRetryWithOpenAI}
+                            disabled={isRetrying || isFindingAll}
+                            className="w-full md:w-auto bg-green-600 hover:bg-green-700 text-white font-bold py-2 px-4 rounded-lg transition-colors flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed"
+                          >
+                            {isRetrying ? <><Loader size="sm" /><span className="ml-2">Retrying...</span></> : `Retry Failed with OpenAI (${clientsToRetryCount})`}
+                          </button>
+                        )}
                         <button
                           onClick={handleDownloadCSV}
                           disabled={clients.length === 0}
@@ -383,7 +505,18 @@ const App: React.FC = () => {
                           <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 mr-2" viewBox="0 0 20 20" fill="currentColor">
                             <path fillRule="evenodd" d="M3 17a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zm3.293-7.707a1 1 0 011.414 0L9 10.586V3a1 1 0 112 0v7.586l1.293-1.293a1 1 0 111.414 1.414l-3 3a1 1 0 01-1.414 0l-3-3a1 1 0 010-1.414z" clipRule="evenodd" />
                           </svg>
-                          Download Results as CSV
+                          Download CSV
+                        </button>
+                         <button
+                          onClick={handleResetSettings}
+                          className="w-full md:w-auto text-gray-600 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-700 font-bold py-2 px-4 rounded-lg transition-colors flex items-center justify-center"
+                          title="Reset API Key and Sheet ID"
+                        >
+                          <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                          </svg>
+                          Reset
                         </button>
                     </div>
                 </div>
